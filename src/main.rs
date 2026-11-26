@@ -8,6 +8,7 @@
 //! - while a finger drags along a pair it sends where on the pair the finger is; the helper turns that into the
 //!   value under the finger on the drawn track and sets app volume through Core Audio, or hands brightness to the
 //!   brightness plugin's pipe (the plugin owns DDC: two processes talking DDC at once collide on the I2C bus).
+//!   The value moves in steps of 5 % (see `magnet`).
 //!
 //! The plugins redraw the keys from the new value (VC NEO through its Audio Router, brightness at once), so the
 //! phone needs no value back. One blocking thread per phone and no timers: idle costs nothing.
@@ -17,7 +18,10 @@
 //!   'B' id:u8                                 a drag on slider id starts
 //!   'A' id:u8 position:u16                    the finger along the pair's two key images, 0..1000 from the outer
 //!                                             edge of the 0 % end to the outer edge of the 100 % end
+//!   'W'                                       asks for this computer's MAC address, for Wake-on-LAN: Android 11
+//!                                             and later hide it from apps; answered with 'W'
 //! Wire (helper -> phone):
+//!   'W' mac[6]                                the network adapter the connection came in on; zeros if unknown
 //!   'S' seq:u8 n:u8 n*(loCol loRow hiCol hiRow id)   the page's faders; lo is the 0 % end, hi the 100 % end,
 //!                                                    id is the fader's index in this reply
 
@@ -33,6 +37,7 @@ use std::time::SystemTime;
 use serde::Deserialize;
 use windows::core::{Interface, GUID, PWSTR};
 use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::NetworkManagement::IpHelper::SendARP;
 use windows::Win32::Media::Audio::{
     eRender, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
     DEVICE_STATE_ACTIVE,
@@ -56,6 +61,22 @@ const TRACK_LEN: f32 = 224.0;
 /// The value, 0..1, under a finger at [position] (0..1000 along the pair from the 0 % end).
 fn value_at(position: u16) -> f32 {
     ((position.min(1000) as f32 / 1000.0 * PAIR - TRACK_START) / TRACK_LEN).clamp(0.0, 1.0)
+}
+
+/// [value] (0..1) on the nearest multiple of 5 %. A softer pull that kept the values in between reachable was
+/// tried first (held within 1.5, then 2 % of a multiple) and felt too weak under the finger; the keys' own
+/// presses still step finer.
+fn magnet(value: f32) -> f32 {
+    (value * 20.0).round() / 20.0
+}
+
+/// The MAC address of this computer's network adapter that owns [ip]: asked about one of the computer's own
+/// addresses, SendARP answers with that adapter's. None for loopback and IPv6.
+fn mac_of(ip: IpAddr) -> Option<[u8; 6]> {
+    let IpAddr::V4(v4) = ip else { return None };
+    let (mut mac, mut len) = ([0u8; 6], 6u32);
+    let rc = unsafe { SendARP(u32::from_ne_bytes(v4.octets()), 0, mac.as_mut_ptr().cast(), &mut len) };
+    (rc == 0 && len == 6).then_some(mac)
 }
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
@@ -291,6 +312,7 @@ enum Frame<'a> {
     Page { seq: u8, page: u16, profile: &'a str },
     Begin(u8),
     At(u8, u16),
+    Mac,
 }
 
 /// The next frame and its length; Ok(None) if more bytes are needed, Err on anything malformed.
@@ -304,6 +326,7 @@ fn next_frame(b: &[u8]) -> Result<Option<(Frame<'_>, usize)>, ()> {
         },
         b'B' => 2,
         b'A' => 4,
+        b'W' => 1,
         _ => return Err(()),
     };
     if b.len() < need {
@@ -316,6 +339,7 @@ fn next_frame(b: &[u8]) -> Result<Option<(Frame<'_>, usize)>, ()> {
             profile: std::str::from_utf8(&b[5..need]).map_err(|_| ())?,
         },
         b'B' => Frame::Begin(b[1]),
+        b'W' => Frame::Mac,
         _ => Frame::At(b[1], u16::from_le_bytes([b[2], b[3]])),
     };
     Ok(Some((f, need)))
@@ -384,7 +408,7 @@ impl Conn {
     }
 
     fn drag_to(&mut self, id: u8, position: u16) {
-        let value = value_at(position);
+        let value = magnet(value_at(position));
         match self.drags.get_mut(&id) {
             Some(Drag::App { vols, last }) => {
                 // Whole percent, as VC NEO shows it: finer steps would only cost the plugin extra redraws.
@@ -453,6 +477,13 @@ fn serve(mut s: TcpStream, peer: SocketAddr) {
                         conn.drag_to(id, at);
                     }
                     conn.begin(id);
+                }
+                Frame::Mac => {
+                    let mut reply = vec![b'W'];
+                    reply.extend(s.local_addr().ok().and_then(|a| mac_of(a.ip())).unwrap_or_default());
+                    if s.write_all(&reply).is_err() {
+                        break 'read;
+                    }
                 }
                 Frame::At(id, position) => match moves.iter_mut().find(|m| m.0 == id) {
                     Some(m) => m.1 = position,
@@ -583,6 +614,7 @@ mod tests {
         assert!(next_frame(&[b'M', 1, 0, 0]).is_err()); // the old relative move
         assert!(matches!(next_frame(&b[12..]), Ok(None)));
         assert!(next_frame(&[b'X']).is_err());
+        assert!(matches!(next_frame(&[b'W', b'B']), Ok(Some((Frame::Mac, 1)))));
         assert!(next_frame(&[b'P', 0, 0, 0, 200]).is_err());
     }
 
@@ -619,6 +651,30 @@ mod tests {
         assert_eq!(value_at(889), 1.0); // 256 px
         assert_eq!(value_at(1000), 1.0);
         assert_eq!(value_at(u16::MAX), 1.0);
+    }
+
+    #[test]
+    fn multiples_of_five_hold_the_value() {
+        let pct = |v: f32| (magnet(v) * 100.0).round() as i32;
+        assert_eq!((pct(0.0), pct(1.0)), (0, 100));
+        assert_eq!((pct(0.49), pct(0.51), pct(0.362), pct(0.988)), (50, 50, 35, 100));
+        assert_eq!((pct(0.52), pct(0.53)), (50, 55));
+        // Along the whole pair: never backwards, one step of 5 at a time.
+        let all: Vec<i32> = (0..=1000).map(|p| pct(value_at(p))).collect();
+        assert!(all.windows(2).all(|w| w[1] == w[0] || w[1] == w[0] + 5));
+        assert_eq!((all[0], all[1000]), (0, 100));
+    }
+
+    #[test]
+    fn own_addresses_have_a_mac() {
+        assert_eq!(mac_of("127.0.0.1".parse().unwrap()), None);
+        assert_eq!(mac_of("::1".parse().unwrap()), None);
+        // The address this computer reaches the network from, if it has one.
+        let lan = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| s.connect("192.0.2.1:9").and(s.local_addr()));
+        if let Ok(a) = lan.map(|a| a.ip()).map_err(drop).and_then(|ip| if ip.is_loopback() { Err(()) } else { Ok(ip) }) {
+            let mac = mac_of(a).expect("a LAN address belongs to an adapter");
+            assert!(mac != [0; 6] && mac[0] & 1 == 0);
+        }
     }
 
     #[test]
