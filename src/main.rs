@@ -18,7 +18,10 @@
 //!   'B' id:u8                                 a drag on slider id starts
 //!   'A' id:u8 position:u16                    the finger along the pair's two key images, 0..1000 from the outer
 //!                                             edge of the 0 % end to the outer edge of the 100 % end
+//!   'W'                                       asks for this computer's MAC address, for Wake-on-LAN: Android 11
+//!                                             and later hide it from apps; answered with 'W'
 //! Wire (helper -> phone):
+//!   'W' mac[6]                                the network adapter the connection came in on; zeros if unknown
 //!   'S' seq:u8 n:u8 n*(loCol loRow hiCol hiRow id)   the page's faders; lo is the 0 % end, hi the 100 % end,
 //!                                                    id is the fader's index in this reply
 
@@ -34,6 +37,7 @@ use std::time::SystemTime;
 use serde::Deserialize;
 use windows::core::{Interface, GUID, PWSTR};
 use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::NetworkManagement::IpHelper::SendARP;
 use windows::Win32::Media::Audio::{
     eRender, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
     DEVICE_STATE_ACTIVE,
@@ -64,6 +68,15 @@ fn value_at(position: u16) -> f32 {
 /// presses still step finer.
 fn magnet(value: f32) -> f32 {
     (value * 20.0).round() / 20.0
+}
+
+/// The MAC address of this computer's network adapter that owns [ip]: asked about one of the computer's own
+/// addresses, SendARP answers with that adapter's. None for loopback and IPv6.
+fn mac_of(ip: IpAddr) -> Option<[u8; 6]> {
+    let IpAddr::V4(v4) = ip else { return None };
+    let (mut mac, mut len) = ([0u8; 6], 6u32);
+    let rc = unsafe { SendARP(u32::from_ne_bytes(v4.octets()), 0, mac.as_mut_ptr().cast(), &mut len) };
+    (rc == 0 && len == 6).then_some(mac)
 }
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
@@ -299,6 +312,7 @@ enum Frame<'a> {
     Page { seq: u8, page: u16, profile: &'a str },
     Begin(u8),
     At(u8, u16),
+    Mac,
 }
 
 /// The next frame and its length; Ok(None) if more bytes are needed, Err on anything malformed.
@@ -312,6 +326,7 @@ fn next_frame(b: &[u8]) -> Result<Option<(Frame<'_>, usize)>, ()> {
         },
         b'B' => 2,
         b'A' => 4,
+        b'W' => 1,
         _ => return Err(()),
     };
     if b.len() < need {
@@ -324,6 +339,7 @@ fn next_frame(b: &[u8]) -> Result<Option<(Frame<'_>, usize)>, ()> {
             profile: std::str::from_utf8(&b[5..need]).map_err(|_| ())?,
         },
         b'B' => Frame::Begin(b[1]),
+        b'W' => Frame::Mac,
         _ => Frame::At(b[1], u16::from_le_bytes([b[2], b[3]])),
     };
     Ok(Some((f, need)))
@@ -462,6 +478,13 @@ fn serve(mut s: TcpStream, peer: SocketAddr) {
                     }
                     conn.begin(id);
                 }
+                Frame::Mac => {
+                    let mut reply = vec![b'W'];
+                    reply.extend(s.local_addr().ok().and_then(|a| mac_of(a.ip())).unwrap_or_default());
+                    if s.write_all(&reply).is_err() {
+                        break 'read;
+                    }
+                }
                 Frame::At(id, position) => match moves.iter_mut().find(|m| m.0 == id) {
                     Some(m) => m.1 = position,
                     None => moves.push((id, position)),
@@ -591,6 +614,7 @@ mod tests {
         assert!(next_frame(&[b'M', 1, 0, 0]).is_err()); // the old relative move
         assert!(matches!(next_frame(&b[12..]), Ok(None)));
         assert!(next_frame(&[b'X']).is_err());
+        assert!(matches!(next_frame(&[b'W', b'B']), Ok(Some((Frame::Mac, 1)))));
         assert!(next_frame(&[b'P', 0, 0, 0, 200]).is_err());
     }
 
@@ -639,6 +663,18 @@ mod tests {
         let all: Vec<i32> = (0..=1000).map(|p| pct(value_at(p))).collect();
         assert!(all.windows(2).all(|w| w[1] == w[0] || w[1] == w[0] + 5));
         assert_eq!((all[0], all[1000]), (0, 100));
+    }
+
+    #[test]
+    fn own_addresses_have_a_mac() {
+        assert_eq!(mac_of("127.0.0.1".parse().unwrap()), None);
+        assert_eq!(mac_of("::1".parse().unwrap()), None);
+        // The address this computer reaches the network from, if it has one.
+        let lan = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| s.connect("192.0.2.1:9").and(s.local_addr()));
+        if let Ok(a) = lan.map(|a| a.ip()).map_err(drop).and_then(|ip| if ip.is_loopback() { Err(()) } else { Ok(ip) }) {
+            let mac = mac_of(a).expect("a LAN address belongs to an adapter");
+            assert!(mac != [0; 6] && mac[0] & 1 == 0);
+        }
     }
 
     #[test]
