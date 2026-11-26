@@ -8,6 +8,7 @@
 //! - while a finger drags along a pair it sends where on the pair the finger is; the helper turns that into the
 //!   value under the finger on the drawn track and sets app volume through Core Audio, or hands brightness to the
 //!   brightness plugin's pipe (the plugin owns DDC: two processes talking DDC at once collide on the I2C bus).
+//!   The value moves in steps of 5 % (see `magnet`).
 //!
 //! The plugins redraw the keys from the new value (VC NEO through its Audio Router, brightness at once), so the
 //! phone needs no value back. One blocking thread per phone and no timers: idle costs nothing.
@@ -56,6 +57,13 @@ const TRACK_LEN: f32 = 224.0;
 /// The value, 0..1, under a finger at [position] (0..1000 along the pair from the 0 % end).
 fn value_at(position: u16) -> f32 {
     ((position.min(1000) as f32 / 1000.0 * PAIR - TRACK_START) / TRACK_LEN).clamp(0.0, 1.0)
+}
+
+/// [value] (0..1) on the nearest multiple of 5 %. A softer pull that kept the values in between reachable was
+/// tried first (held within 1.5, then 2 % of a multiple) and felt too weak under the finger; the keys' own
+/// presses still step finer.
+fn magnet(value: f32) -> f32 {
+    (value * 20.0).round() / 20.0
 }
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
@@ -384,7 +392,7 @@ impl Conn {
     }
 
     fn drag_to(&mut self, id: u8, position: u16) {
-        let value = value_at(position);
+        let value = magnet(value_at(position));
         match self.drags.get_mut(&id) {
             Some(Drag::App { vols, last }) => {
                 // Whole percent, as VC NEO shows it: finer steps would only cost the plugin extra redraws.
@@ -619,6 +627,18 @@ mod tests {
         assert_eq!(value_at(889), 1.0); // 256 px
         assert_eq!(value_at(1000), 1.0);
         assert_eq!(value_at(u16::MAX), 1.0);
+    }
+
+    #[test]
+    fn multiples_of_five_hold_the_value() {
+        let pct = |v: f32| (magnet(v) * 100.0).round() as i32;
+        assert_eq!((pct(0.0), pct(1.0)), (0, 100));
+        assert_eq!((pct(0.49), pct(0.51), pct(0.362), pct(0.988)), (50, 50, 35, 100));
+        assert_eq!((pct(0.52), pct(0.53)), (50, 55));
+        // Along the whole pair: never backwards, one step of 5 at a time.
+        let all: Vec<i32> = (0..=1000).map(|p| pct(value_at(p))).collect();
+        assert!(all.windows(2).all(|w| w[1] == w[0] || w[1] == w[0] + 5));
+        assert_eq!((all[0], all[1000]), (0, 100));
     }
 
     #[test]

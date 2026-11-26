@@ -12,7 +12,8 @@ Stream Deck. OpenDeck opens a second connection to this helper on TCP 28199:
    - Volume Controller NEO `manual-detection` keys with `volumeChange: adjust` and a ± `volumeStep`.
    - `com.xenside.brightness.up` / `.down` ([streamdeck-brightness](https://github.com/OpenDeckMobile/streamdeck-brightness)).
 2. While a finger drags along a pair, OpenDeck sends where on the pair the finger is. The helper maps that onto the
-   track the plugin draws, so the knob sits under the finger and the whole range fits between the two keys.
+   track the plugin draws, so the knob sits under the finger and the whole range fits between the two keys. A
+   drag moves the value in steps of 5 %; the keys' own presses still step finer.
    - App volume: Core Audio `SetMasterVolume` on every session of the app on every active output. An exe matches
      by file name (Discord's path has a version folder), a package folder matches as a prefix (Spotify). The Audio
      Router sees the change and VC NEO redraws the keys.
